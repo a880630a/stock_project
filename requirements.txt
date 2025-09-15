@@ -1,0 +1,6 @@
+# FinBERT 金融情感分析專案依賴
+huggingface_hub>=0.16.0
+pandas>=1.5.0
+numpy>=1.21.0
+transformers>=4.21.0
+torch>=1.12.0
