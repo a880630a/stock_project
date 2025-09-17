@@ -1,6 +1,13 @@
 # FinBERT 金融情感分析專案依賴
+
+# 核心依賴
 huggingface_hub>=0.16.0
 pandas>=1.5.0
 numpy>=1.21.0
 transformers>=4.21.0
 torch>=1.12.0
+python-dotenv>=0.19.0
+
+# Web API 依賴（可選）
+flask>=2.0.0
+flask-cors>=3.0.0

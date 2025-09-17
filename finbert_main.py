@@ -18,6 +18,7 @@ import argparse
 import time
 import json
 import os
+from dotenv import load_dotenv
 from datetime import datetime
 from huggingface_hub import InferenceClient
 from typing import List, Dict, Any, Optional
@@ -34,6 +35,9 @@ class FinBERTAnalyzer:
         Args:
             api_key: HuggingFace API 金鑰，如果為None則從環境變量讀取
         """
+        # 載入 .env 檔案
+        load_dotenv()
+        
         # 設定環境變數
         if api_key is None:
             api_key = os.getenv('HF_TOKEN')
@@ -148,6 +152,77 @@ class FinBERTAnalyzer:
             self.test_results.append(error_result)
             return error_result
     
+    def analyze_sentiment_with_explanation(self, text: str, test_name: str = "") -> Dict[str, Any]:
+        """
+        分析文本情感並提供詳細解釋、總結和依據
+        
+        Args:
+            text: 要分析的文本
+            test_name: 測試案例名稱
+            
+        Returns:
+            包含詳細解釋的分析結果
+        """
+        try:
+            start_time = time.time()
+            
+            # 1. 首先進行基本情感分析
+            basic_result = self.client.text_classification(text, model=self.model_name)
+            
+            # 2. 使用支持文本生成的模型進行總結和解釋
+            # 使用 microsoft/DialoGPT-medium 或其他支持文本生成的模型
+            generation_client = InferenceClient(model="microsoft/DialoGPT-medium")
+            
+            # 3. 生成文本總結（基於關鍵詞分析）
+            text_summary = self._generate_text_summary(text)
+            
+            # 4. 分析關鍵詞和依據
+            analysis_explanation = self._generate_analysis_explanation(text, basic_result)
+            
+            # 5. 結果解釋
+            if isinstance(basic_result, list) and len(basic_result) > 0:
+                predictions = basic_result
+                best_prediction = max(predictions, key=lambda x: x.get('score', 0))
+                predicted_label = best_prediction.get('label', 'Unknown').lower()
+                confidence = best_prediction.get('score', 0)
+                
+                result_explanation = self._generate_result_explanation(text, predicted_label, confidence, predictions)
+            else:
+                predictions = []
+                result_explanation = "無法生成結果解釋"
+            
+            end_time = time.time()
+            
+            analysis_result = {
+                "test_name": test_name,
+                "input_text": text,
+                "predictions": predictions,
+                "text_summary": text_summary,
+                "analysis_explanation": analysis_explanation,
+                "result_explanation": result_explanation,
+                "response_time": round(end_time - start_time, 3),
+                "timestamp": datetime.now().isoformat(),
+                "language": self._detect_language(text),
+                "success": True,
+                "analysis_type": "enhanced_sentiment_analysis"
+            }
+            
+            self.test_results.append(analysis_result)
+            return analysis_result
+            
+        except Exception as e:
+            error_result = {
+                "test_name": test_name,
+                "input_text": text,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+                "language": self._detect_language(text),
+                "success": False,
+                "analysis_type": "enhanced_sentiment_analysis"
+            }
+            self.test_results.append(error_result)
+            return error_result
+
     def generate_trading_strategy(self, price: float, rsi: float, sentiment: float, test_name: str = "") -> Dict[str, Any]:
         """
         基於價格、RSI 和情感分析生成交易策略
@@ -273,6 +348,204 @@ class FinBERTAnalyzer:
         except (ValueError, IndexError):
             return 0.0
     
+    def _generate_text_summary(self, text: str) -> str:
+        """
+        基於關鍵詞分析生成文本總結
+        
+        Args:
+            text: 輸入文本
+            
+        Returns:
+            文本總結
+        """
+        try:
+            # 提取關鍵詞和實體
+            keywords = self._extract_keywords(text)
+            entities = self._extract_entities(text)
+            
+            # 生成總結
+            if keywords or entities:
+                summary_parts = []
+                if entities:
+                    summary_parts.append(f"涉及實體：{', '.join(entities[:3])}")
+                if keywords:
+                    summary_parts.append(f"關鍵詞：{', '.join(keywords[:5])}")
+                
+                summary = f"這是一則關於{' | '.join(summary_parts)}的金融新聞。"
+            else:
+                summary = f"這是一則金融相關文本，長度為{len(text)}個字符。"
+                
+            return summary
+            
+        except Exception as e:
+            return f"文本總結生成失敗：{str(e)}"
+    
+    def _generate_analysis_explanation(self, text: str, predictions: List[Dict]) -> str:
+        """
+        生成分析依據和關鍵詞解釋
+        
+        Args:
+            text: 輸入文本
+            predictions: 預測結果
+            
+        Returns:
+            分析依據說明
+        """
+        try:
+            # 分析關鍵詞
+            positive_keywords = self._find_sentiment_keywords(text, 'positive')
+            negative_keywords = self._find_sentiment_keywords(text, 'negative')
+            neutral_keywords = self._find_sentiment_keywords(text, 'neutral')
+            
+            explanation_parts = []
+            
+            # 關鍵詞分析
+            if positive_keywords:
+                explanation_parts.append(f"正面關鍵詞：{', '.join(positive_keywords)}")
+            if negative_keywords:
+                explanation_parts.append(f"負面關鍵詞：{', '.join(negative_keywords)}")
+            if neutral_keywords:
+                explanation_parts.append(f"中性關鍵詞：{', '.join(neutral_keywords)}")
+            
+            # 語言分析
+            language = self._detect_language(text)
+            explanation_parts.append(f"語言類型：{language}")
+            
+            # 文本長度分析
+            explanation_parts.append(f"文本長度：{len(text)}字符")
+            
+            return " | ".join(explanation_parts) if explanation_parts else "無法提取明確的分析依據"
+            
+        except Exception as e:
+            return f"分析依據生成失敗：{str(e)}"
+    
+    def _generate_result_explanation(self, text: str, predicted_label: str, confidence: float, predictions: List[Dict]) -> str:
+        """
+        生成結果解釋
+        
+        Args:
+            text: 輸入文本
+            predicted_label: 預測標籤
+            confidence: 信心度
+            predictions: 所有預測結果
+            
+        Returns:
+            結果解釋
+        """
+        try:
+            explanation_parts = []
+            
+            # 信心度解釋
+            if confidence > 0.8:
+                confidence_desc = "非常高的信心度"
+            elif confidence > 0.6:
+                confidence_desc = "較高的信心度"
+            elif confidence > 0.4:
+                confidence_desc = "中等信心度"
+            else:
+                confidence_desc = "較低的信心度"
+            
+            explanation_parts.append(f"模型以{confidence_desc}({confidence:.3f})判斷此文本為{predicted_label}情感")
+            
+            # 競爭標籤分析
+            if len(predictions) > 1:
+                sorted_preds = sorted(predictions, key=lambda x: x.get('score', 0), reverse=True)
+                if len(sorted_preds) >= 2:
+                    second_best = sorted_preds[1]
+                    second_label = second_best.get('label', '').lower()
+                    second_score = second_best.get('score', 0)
+                    
+                    score_diff = confidence - second_score
+                    if score_diff < 0.2:
+                        explanation_parts.append(f"與次高分類{second_label}({second_score:.3f})差距較小，存在一定不確定性")
+                    else:
+                        explanation_parts.append(f"與次高分類{second_label}({second_score:.3f})差距明顯，分類較為確定")
+            
+            # 語言相關風險
+            language = self._detect_language(text)
+            if language in ["中文", "中英混合"]:
+                explanation_parts.append(f"注意：FinBERT主要針對英文訓練，對{language}文本的分析可能存在偏差")
+            
+            return " | ".join(explanation_parts)
+            
+        except Exception as e:
+            return f"結果解釋生成失敗：{str(e)}"
+    
+    def _extract_keywords(self, text: str) -> List[str]:
+        """提取關鍵詞"""
+        # 簡單的關鍵詞提取邏輯
+        import re
+        
+        # 金融相關關鍵詞模式（中英文）
+        financial_patterns = [
+            r'(?:股價|股票|股市|股份|stock|share)',
+            r'(?:上漲|下跌|大漲|重挫|暴跌|飆升|創新高|創新低|surge|soar|plummet|crash)',
+            r'(?:財報|營收|獲利|虧損|EPS|earnings|revenue|profit|loss)',
+            r'(?:投資|交易|買入|賣出|持有|investment|trading|buy|sell|hold)',
+            r'(?:市場|經濟|金融|銀行|market|economy|financial|bank)',
+            r'(?:Apple|蘋果|Tesla|特斯拉|NVIDIA|輝達|台積電|TSMC|聯發科|MediaTek)',
+            r'(?:信心|樂觀|悲觀|看好|看空|confidence|optimistic|pessimistic|bullish|bearish)',
+            r'(?:強勁|疲軟|穩定|波動|strong|weak|stable|volatile)',
+        ]
+        
+        keywords = []
+        for pattern in financial_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            keywords.extend(matches)
+        
+        return list(set(keywords))[:10]  # 返回前10個不重複的關鍵詞
+    
+    def _extract_entities(self, text: str) -> List[str]:
+        """提取實體（公司名稱等）"""
+        import re
+        
+        # 常見公司名稱模式
+        company_patterns = [
+            r'\b(?:Apple|蘋果)\b',
+            r'\b(?:Tesla|特斯拉)\b', 
+            r'\b(?:NVIDIA|輝達)\b',
+            r'\b(?:台積電|TSMC)\b',
+            r'\b(?:聯發科|MediaTek)\b',
+            r'\b(?:Google|谷歌)\b',
+            r'\b(?:Microsoft|微軟)\b',
+            r'\b(?:Amazon|亞馬遜)\b',
+        ]
+        
+        entities = []
+        for pattern in company_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            entities.extend(matches)
+        
+        return list(set(entities))[:5]  # 返回前5個不重複的實體
+    
+    def _find_sentiment_keywords(self, text: str, sentiment_type: str) -> List[str]:
+        """尋找特定情感的關鍵詞"""
+        import re
+        
+        sentiment_patterns = {
+            'positive': [
+                r'(?:上漲|大漲|飆升|創新高|突破|強勁|樂觀|看好|利多|信心大增|表現強勁)',
+                r'(?:surge|soar|rally|bullish|positive|gain|rise|up|beating|strong|confidence)'
+            ],
+            'negative': [
+                r'(?:下跌|重挫|暴跌|創新低|崩盤|悲觀|看空|利空|虧損|表現疲軟)',
+                r'(?:plummet|crash|bearish|negative|loss|decline|down|fall|disappointing|weak)'
+            ],
+            'neutral': [
+                r'(?:持平|穩定|觀望|中性|公布|宣布|會議|決策|發布)',
+                r'(?:stable|neutral|announce|meeting|decision|report|release|publish)'
+            ]
+        }
+        
+        keywords = []
+        patterns = sentiment_patterns.get(sentiment_type, [])
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            keywords.extend(matches)
+        
+        return list(set(keywords))[:5]  # 返回前5個不重複的關鍵詞
+
     def _get_action_label(self, action: int) -> str:
         """
         獲取動作標籤
@@ -311,7 +584,9 @@ class FinBERTAnalyzer:
         
         analysis_type = result.get('analysis_type', 'sentiment_classification')
         
-        if analysis_type == 'sentiment_scoring':
+        if analysis_type == 'enhanced_sentiment_analysis':
+            return self._format_enhanced_analysis_result(result, detailed)
+        elif analysis_type == 'sentiment_scoring':
             return self._format_sentiment_scoring_result(result, detailed)
         elif analysis_type == 'trading_strategy':
             return self._format_trading_strategy_result(result, detailed)
@@ -390,6 +665,66 @@ class FinBERTAnalyzer:
                 output += f"\n   建議結合關鍵詞分析或翻譯成英文後再分析"
         else:
             output = f"{sentiment_icon} ({sentiment_score:.3f})"
+        
+        return output
+    
+    def _format_enhanced_analysis_result(self, result: Dict[str, Any], detailed: bool = True) -> str:
+        """格式化增強分析結果"""
+        predictions = result.get('predictions', [])
+        if not predictions:
+            return "❌ 無法獲得有效的預測結果"
+        
+        # 找出最高信心度的預測
+        best_prediction = max(predictions, key=lambda x: x.get('score', 0))
+        label = best_prediction.get('label', 'Unknown').lower()
+        score = best_prediction.get('score', 0)
+        
+        # 情感標籤美化
+        label_icons = {
+            'positive': '🟢 正面',
+            'negative': '🔴 負面',
+            'neutral': '🟡 中性'
+        }
+        
+        display_label = label_icons.get(label, f"❓ {label}")
+        
+        if detailed:
+            output = f"""
+📝 輸入文本: {result['input_text']}
+🌐 語言類型: {result['language']}
+🎯 分析結果: {display_label}
+📊 信心度: {score:.3f} ({score*100:.1f}%)
+⏱️  回應時間: {result['response_time']}秒
+
+📋 詳細預測結果:"""
+            
+            for pred in sorted(predictions, key=lambda x: x.get('score', 0), reverse=True):
+                pred_label = pred.get('label', '').lower()
+                pred_score = pred.get('score', 0)
+                pred_display = label_icons.get(pred_label, pred_label)
+                output += f"\n   {pred_display}: {pred_score:.3f} ({pred_score*100:.1f}%)"
+            
+            # 添加文本總結
+            text_summary = result.get('text_summary', '').strip()
+            if text_summary:
+                output += f"\n\n📄 文本總結:\n   {text_summary}"
+            
+            # 添加分析依據
+            analysis_explanation = result.get('analysis_explanation', '').strip()
+            if analysis_explanation:
+                output += f"\n\n🔍 分析依據:\n   {analysis_explanation.replace(chr(10), chr(10) + '   ')}"
+            
+            # 添加結果解釋
+            result_explanation = result.get('result_explanation', '').strip()
+            if result_explanation:
+                output += f"\n\n💡 結果解釋:\n   {result_explanation.replace(chr(10), chr(10) + '   ')}"
+            
+            # 添加建議
+            if result['language'] in ["中文", "中英混合"]:
+                output += f"\n\n⚠️  語言提醒: 檢測到{result['language']}文本，FinBERT主要針對英文訓練"
+                output += f"\n   建議結合關鍵詞分析或翻譯成英文後再分析以獲得更準確的結果"
+        else:
+            output = f"{display_label} ({score:.3f})"
         
         return output
     
@@ -670,6 +1005,7 @@ class FinBERTInteractive:
         print("   - 輸入 'examples' 查看測試範例")
         print("   - 輸入 'score:文本' 進行情感評分分析")
         print("   - 輸入 'strategy:價格,RSI,情感' 進行交易策略分析")
+        print("   - 輸入 'explain:文本' 進行增強分析（包含總結、依據、解釋）")
         print("="*60)
         
         while True:
@@ -721,6 +1057,17 @@ class FinBERTInteractive:
                         print("⚠️ 參數格式錯誤，請確保價格、RSI、情感都是數字")
                         print("   例如：strategy:100.0,0.5,0.3")
                 
+                elif user_input.startswith('explain:'):
+                    # 增強分析（包含總結、依據、解釋）
+                    text = user_input[8:].strip()
+                    if text:
+                        print("\n🔍 正在進行增強分析（包含總結、依據、解釋）...")
+                        result = self.analyzer.analyze_sentiment_with_explanation(text)
+                        formatted_result = self.analyzer.format_result(result)
+                        print(formatted_result)
+                    else:
+                        print("⚠️ 請提供要分析的文本，格式：explain:您的文本")
+                
                 else:
                     # 一般情感分析
                     print("\n🔍 正在分析中...")
@@ -764,6 +1111,12 @@ class FinBERTInteractive:
         print("   strategy:100.0,0.8,-0.6   # 價格100, RSI 0.8(高), 情感-0.6(負面)")
         print("   strategy:100.0,0.5,0.1    # 價格100, RSI 0.5(中), 情感0.1(中性)")
         
+        print("\n🔍 增強分析範例（包含總結、依據、解釋）:")
+        print("   explain:Apple stock surged 15% after beating earnings expectations")
+        print("   explain:Tesla shares plummeted due to production delays")
+        print("   explain:今天蘋果發布了iPhone 17")
+        print("   explain:台積電股價創新高，投資人信心大增")
+        
         print("="*60)
 
 def main():
@@ -780,6 +1133,7 @@ def main():
     python finbert_main.py --analyze "Apple stock surged"   # 分析指定文本
     python finbert_main.py --sentiment-score "Good news"    # 情感評分分析
     python finbert_main.py --trading-strategy "100,0.5,0.3" # 交易策略分析
+    python finbert_main.py --explain "Apple stock surged"   # 增強分析（總結+依據+解釋）
         """
     )
     
@@ -797,6 +1151,8 @@ def main():
                        help='對指定文本進行情感評分分析')
     parser.add_argument('--trading-strategy', type=str,
                        help='進行交易策略分析，格式：價格,RSI,情感 (例如：100.0,0.5,0.3)')
+    parser.add_argument('--explain', type=str,
+                       help='進行增強分析（包含總結、依據、解釋）')
     parser.add_argument('--api-key', type=str,
                        default=None,
                        help='HuggingFace API 金鑰（如果未提供，將從 HF_TOKEN 環境變量讀取）')
@@ -805,7 +1161,7 @@ def main():
     
     # 如果沒有提供任何參數，顯示幫助
     if not any([args.interactive, args.simple_test, args.enhanced_test, args.language_comparison, 
-                args.analyze, args.sentiment_score, args.trading_strategy]):
+                args.analyze, args.sentiment_score, args.trading_strategy, args.explain]):
         parser.print_help()
         return
     
@@ -869,6 +1225,14 @@ def main():
             except ValueError:
                 print("❌ 參數格式錯誤，請確保價格、RSI、情感都是數字")
                 print("   例如：--trading-strategy 100.0,0.5,0.3")
+        
+        elif args.explain:
+            # 增強分析（包含總結、依據、解釋）
+            print("🚀 FinBERT 增強分析（包含總結、依據、解釋）")
+            print("="*60)
+            result = analyzer.analyze_sentiment_with_explanation(args.explain)
+            formatted_result = analyzer.format_result(result)
+            print(formatted_result)
             
     except KeyboardInterrupt:
         print("\n⚠️ 程式被使用者中斷")
