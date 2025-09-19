@@ -32,6 +32,7 @@ def init_analyzer():
     try:
         # 使用預設API金鑰
         api_key = os.getenv('HF_TOKEN')
+        print(api_key)
         if not api_key:
             raise ValueError("請設置 HF_TOKEN 環境變量。請參考 README.md 了解如何設置。")
         analyzer = FinBERTAnalyzer(api_key)
