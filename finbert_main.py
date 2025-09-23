@@ -21,7 +21,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 from huggingface_hub import InferenceClient
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import re
 
@@ -111,24 +111,23 @@ class FinBERTAnalyzer:
         try:
             start_time = time.time()
             
-            # 使用 text_generation 進行情感分析
-            sentiment_prompt = f"Analyze sentiment of financial news: '{text}'. Score -1 (negative) to 1 (positive). Format: 'Sentiment: [score]'"
-            sentiment_response = self.client.text_generation(
-                sentiment_prompt, 
-                max_new_tokens=20, 
-                temperature=0.1
-            )
+            # 使用 text_classification 進行情感分析，然後轉換為數值評分
+            classification_result = self.client.text_classification(text, model=self.model_name)
             
             end_time = time.time()
             
-            # 解析數值評分
-            sentiment_score = self._parse_sentiment_score(sentiment_response)
+            # 將分類結果轉換為數值評分
+            sentiment_score = self._convert_classification_to_score(classification_result)
+            
+            # 生成解釋性回應
+            sentiment_response = self._generate_score_explanation(classification_result, sentiment_score)
             
             analysis_result = {
                 "test_name": test_name,
                 "input_text": text,
                 "raw_response": sentiment_response,
                 "sentiment_score": sentiment_score,
+                "classification_result": classification_result,
                 "response_time": round(end_time - start_time, 3),
                 "timestamp": datetime.now().isoformat(),
                 "language": self._detect_language(text),
@@ -239,23 +238,11 @@ class FinBERTAnalyzer:
         try:
             start_time = time.time()
             
-            # 構建策略分析提示
-            strategy_prompt = (
-                f"As aggressive trader, state (price: {price}, RSI: {rsi}, sentiment: {sentiment}), "
-                f"suggest buy/sell/hold. Reason: Step 1: Analyze price. Step 2: Assess RSI and sentiment. "
-                f"Step 3: Decide."
-            )
-            
-            strategy_response = self.client.text_generation(
-                strategy_prompt, 
-                max_new_tokens=100, 
-                temperature=0.7
-            )
+            # 使用基於規則的策略生成，而不是依賴 text_generation
+            # 因為 FinBERT 模型只支援 text_classification
+            action, strategy_response = self._generate_rule_based_strategy(price, rsi, sentiment, test_name)
             
             end_time = time.time()
-            
-            # 解析交易動作
-            action = self.parse_action(strategy_response)
             
             strategy_result = {
                 "test_name": test_name,
@@ -291,6 +278,135 @@ class FinBERTAnalyzer:
             }
             self.test_results.append(error_result)
             return error_result
+    
+    def _generate_rule_based_strategy(self, price: float, rsi: float, sentiment: float, test_name: str) -> Tuple[int, str]:
+        """
+        基於規則生成交易策略（不依賴 text_generation）
+        
+        Args:
+            price: 當前股價
+            rsi: RSI 指標值 (0-1)
+            sentiment: 情感評分 (-1 到 1)
+            test_name: 測試案例名稱
+            
+        Returns:
+            (action, strategy_explanation) - 動作代碼和策略說明
+        """
+        # 判斷是否為 aggressive 或 defensive 策略
+        is_aggressive = "aggressive" in test_name.lower()
+        
+        # 基於規則的決策邏輯
+        if is_aggressive:
+            # 激進策略：更傾向於買入，基於情感和低RSI
+            if sentiment > 0.3 and rsi < 0.5:
+                action = 2  # buy
+                reason = f"Aggressive BUY: High sentiment ({sentiment:.2f}) + Low RSI ({rsi:.2f}) indicates strong buying opportunity"
+            elif sentiment > 0.1 and rsi < 0.7:
+                action = 2  # buy
+                reason = f"Aggressive BUY: Positive sentiment ({sentiment:.2f}) with acceptable RSI ({rsi:.2f})"
+            elif sentiment < -0.4 or rsi > 0.8:
+                action = 0  # sell
+                reason = f"Aggressive SELL: Negative sentiment ({sentiment:.2f}) or overbought RSI ({rsi:.2f})"
+            else:
+                action = 1  # hold
+                reason = f"Aggressive HOLD: Mixed signals - sentiment ({sentiment:.2f}), RSI ({rsi:.2f})"
+        else:
+            # 保守策略：更注重風險控制
+            if sentiment > 0.5 and rsi < 0.4:
+                action = 2  # buy
+                reason = f"Defensive BUY: Very positive sentiment ({sentiment:.2f}) + Low RSI ({rsi:.2f}) - low risk entry"
+            elif sentiment < -0.2 or rsi > 0.7:
+                action = 0  # sell
+                reason = f"Defensive SELL: Risk management - negative sentiment ({sentiment:.2f}) or high RSI ({rsi:.2f})"
+            elif sentiment > 0.2 and rsi < 0.6:
+                action = 1  # hold
+                reason = f"Defensive HOLD: Moderate positive sentiment ({sentiment:.2f}) with safe RSI ({rsi:.2f})"
+            else:
+                action = 1  # hold
+                reason = f"Defensive HOLD: Conservative approach - sentiment ({sentiment:.2f}), RSI ({rsi:.2f})"
+        
+        # 構建完整的策略說明
+        strategy_explanation = f"""
+Trading Strategy Analysis:
+Step 1: Price Analysis - Current price: ${price:.2f}
+Step 2: Technical Analysis - RSI: {rsi:.2f} ({'Oversold' if rsi < 0.3 else 'Overbought' if rsi > 0.7 else 'Normal'})
+Step 3: Sentiment Analysis - Sentiment: {sentiment:.2f} ({'Positive' if sentiment > 0.1 else 'Negative' if sentiment < -0.1 else 'Neutral'})
+Step 4: Decision - {reason}
+
+Strategy Type: {'Aggressive' if is_aggressive else 'Defensive'}
+Final Action: {'BUY' if action == 2 else 'SELL' if action == 0 else 'HOLD'}
+        """.strip()
+        
+        return action, strategy_explanation
+    
+    def _convert_classification_to_score(self, classification_result: List[Dict]) -> float:
+        """
+        將分類結果轉換為數值評分 (-1 到 1)
+        
+        Args:
+            classification_result: FinBERT 分類結果
+            
+        Returns:
+            數值化情感評分
+        """
+        if not classification_result:
+            return 0.0
+        
+        # 找出最高信心度的預測
+        best_prediction = max(classification_result, key=lambda x: x.get('score', 0))
+        label = best_prediction.get('label', '').lower()
+        confidence = best_prediction.get('score', 0)
+        
+        # 根據標籤和信心度計算數值評分
+        if label == 'positive':
+            return confidence * 1.0  # 正面情感：0 到 1
+        elif label == 'negative':
+            return confidence * -1.0  # 負面情感：0 到 -1
+        else:  # neutral
+            return 0.0  # 中性情感：0
+    
+    def _generate_score_explanation(self, classification_result: List[Dict], sentiment_score: float) -> str:
+        """
+        生成情感評分的解釋說明
+        
+        Args:
+            classification_result: 分類結果
+            sentiment_score: 數值評分
+            
+        Returns:
+            解釋說明文字
+        """
+        if not classification_result:
+            return "Unable to generate sentiment score explanation"
+        
+        best_prediction = max(classification_result, key=lambda x: x.get('score', 0))
+        label = best_prediction.get('label', '').lower()
+        confidence = best_prediction.get('score', 0)
+        
+        explanation = f"Sentiment Analysis Result:\n"
+        explanation += f"- Primary Classification: {label.upper()} (confidence: {confidence:.3f})\n"
+        explanation += f"- Numerical Score: {sentiment_score:.3f} (range: -1.0 to 1.0)\n"
+        explanation += f"- Interpretation: "
+        
+        if sentiment_score > 0.5:
+            explanation += "Strongly Positive"
+        elif sentiment_score > 0.1:
+            explanation += "Moderately Positive"
+        elif sentiment_score > -0.1:
+            explanation += "Neutral"
+        elif sentiment_score > -0.5:
+            explanation += "Moderately Negative"
+        else:
+            explanation += "Strongly Negative"
+        
+        # 添加所有分類結果
+        explanation += f"\n\nDetailed Classification Results:\n"
+        for pred in sorted(classification_result, key=lambda x: x.get('score', 0), reverse=True):
+            pred_label = pred.get('label', '').upper()
+            pred_score = pred.get('score', 0)
+            explanation += f"- {pred_label}: {pred_score:.3f} ({pred_score*100:.1f}%)\n"
+        
+        return explanation
     
     def parse_action(self, response: str) -> int:
         """
