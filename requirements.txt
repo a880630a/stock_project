@@ -16,5 +16,13 @@ gymnasium>=0.28.0
 flask>=2.0.0
 flask-cors>=3.0.0
 
+# MCP 客戶端依賴
+fastmcp>=2.12.0
+tenacity>=9.0.0
+
+# 數值計算和可視化
+numpy>=1.21.0
+matplotlib>=3.5.0
+
 # 測試和開發依賴
 requests>=2.25.0
