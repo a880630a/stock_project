@@ -15,10 +15,7 @@ import matplotlib
 matplotlib.use('Agg')  # 使用非互動式後端
 try:
     from imitation.algorithms import bc  # 行為克隆
-    from imitation.data import rollout  # 軌跡收集
-    from imitation.data.buffer import ReplayBuffer  # 正確的 ReplayBuffer 導入路徑
     from imitation.data.types import Transitions  # 軌跡轉換類型
-    import gymnasium as gym
     import gymnasium.spaces as spaces  # 新版 spaces
     IMITATION_AVAILABLE = True
 except ImportError as e:
@@ -155,51 +152,77 @@ class LLMAgent:
         if other_trajectories is None:
             other_trajectories = []
         
-        # 若軌跡不足，從 MCP 補充真實軌跡
-        if len(other_trajectories) < 10:
-            print(f"{self.role} 代理: 軌跡不足（{len(other_trajectories)} < 10），從 MCP 補充真實軌跡...")
+        # 若軌跡不足，從 MCP 補充真實軌跡（生成15筆obs）
+        if len(other_trajectories) < 15:
+            print(f"{self.role} 代理: 軌跡不足（{len(other_trajectories)} < 15），從 MCP 補充真實軌跡...")
             try:
-                # 生成 10 筆多樣化真實軌跡以達到學習門檻
-                for i in range(10):
-                    # 獲取基礎數據
-                    real_data = await get_stock_data(stock_code)
-                    base_price = real_data['price']
-                    
-                    # 創造多樣化的市場情況
-                    if i < 8:  # 前 8 筆使用多樣化數據
-                        enhanced_obs = self._generate_diverse_scenario(base_price, stock_code, i)
-                    else:  # 後 2 筆使用真實數據
-                        enhanced_obs = [real_data['price'], real_data['rsi'], real_data['sentiment']]
-                    
-                    # 使用平衡的動作分佈：30% 賣出, 40% 持有, 30% 買入
-                    action = np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
-                    
-                    # 根據市場情況微調動作概率（保持多樣性但符合邏輯）
-                    price, rsi, sentiment = enhanced_obs
-                    if rsi > 0.7:  # 超買時增加賣出概率
-                        if np.random.random() < 0.6:
-                            action = 0
-                    elif rsi < 0.3:  # 超賣時增加買入概率
-                        if np.random.random() < 0.6:
-                            action = 2
-                    elif abs(sentiment) < 0.1:  # 中性時傾向持有
-                        if np.random.random() < 0.5:
-                            action = 1
-                    
-                    other_trajectories.append({
-                        'obs': enhanced_obs,
-                        'action': action,
-                        'stock_code': stock_code,
-                        'source': 'MCP_enhanced_data'
-                    })
-                    print(f"{self.role} 代理: 生成多樣化軌跡 {i+1}/10 - 價格: {enhanced_obs[0]:.2f}, RSI: {enhanced_obs[1]:.3f}, 情感: {enhanced_obs[2]:.3f}, 動作: {action}")
+                # 獲取多月數據用於生成15筆多樣化軌跡
+                from twse_mcp_client import TWSEMCPClient
+                async with TWSEMCPClient() as client:
+                    monthly_data = await client.get_monthly_stock_data(stock_code, months=12)
                 
-                print(f"{self.role} 代理: 成功補充 10 筆真實軌跡，總軌跡數: {len(other_trajectories)}")
+                if len(monthly_data) >= 3:
+                    # 從多月數據生成 15 筆 obs
+                    trajectories_to_generate = 15
+                    print(f"{self.role} 代理: 使用 {len(monthly_data)} 個月數據生成 {trajectories_to_generate} 筆軌跡")
+                    
+                    for i in range(trajectories_to_generate):
+                        # 隨機選擇一個月的數據作為基礎
+                        selected_month = random.choice(monthly_data)
+                        base_price = float(selected_month.get('close', 100.0))
+                        
+                        # 使用真實的多月數據計算RSI
+                        prices = [float(month_data.get('close', 0.0)) for month_data in monthly_data]
+                        from twse_mcp_client import calculate_rsi
+                        rsi = calculate_rsi(prices, period=14)
+                        
+                        # 基於月漲幅計算sentiment（>5% 為 0.7）
+                        sentiment = self._calculate_monthly_sentiment(monthly_data, selected_month)
+                        
+                        # 創造多樣化的市場情況（在真實數據基礎上微調）
+                        if i < 12:  # 前 12 筆使用多樣化數據
+                            enhanced_obs = self._generate_diverse_scenario_from_real_data(
+                                base_price, rsi, sentiment, stock_code, i
+                            )
+                        else:  # 後 3 筆使用純真實數據
+                            enhanced_obs = [base_price, rsi, sentiment]
+                        
+                        # 使用指定的動作概率分佈：30% 賣出, 40% 持有, 30% 買入
+                        action = np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
+                        
+                        # 根據市場情況微調動作概率（保持多樣性但符合邏輯）
+                        price, rsi_val, sentiment_val = enhanced_obs
+                        if rsi_val > 0.7:  # 超買時增加賣出概率
+                            if np.random.random() < 0.6:
+                                action = 0
+                        elif rsi_val < 0.3:  # 超賣時增加買入概率
+                            if np.random.random() < 0.6:
+                                action = 2
+                        elif abs(sentiment_val) < 0.1:  # 中性時傾向持有
+                            if np.random.random() < 0.5:
+                                action = 1
+                        
+                        other_trajectories.append({
+                            'obs': enhanced_obs,
+                            'action': action,
+                            'stock_code': stock_code,
+                            'source': 'MCP_multi_month_data',
+                            'base_month': selected_month.get('date', 'unknown')
+                        })
+                        print(f"{self.role} 代理: 生成多月軌跡 {i+1}/15 - 價格: {enhanced_obs[0]:.2f}, RSI: {enhanced_obs[1]:.3f}, 情感: {enhanced_obs[2]:.3f}, 動作: {action}")
+                    
+                    print(f"{self.role} 代理: 成功補充 15 筆多月真實軌跡，總軌跡數: {len(other_trajectories)}")
+                else:
+                    # 回退到原有方法
+                    print(f"{self.role} 代理: 多月數據不足，使用原有軌跡生成方法")
+                    await self._generate_fallback_trajectories(other_trajectories, stock_code, 15)
+                    
             except Exception as e:
-                print(f"{self.role} 代理: MCP 軌跡生成失敗 ({e})，使用原有軌跡")
+                print(f"{self.role} 代理: MCP 多月軌跡生成失敗 ({e})，使用備用方法")
+                await self._generate_fallback_trajectories(other_trajectories, stock_code, 15)
         
-        if len(other_trajectories) < 10:
-            print(f"{self.role} 代理: 軌跡仍不足（{len(other_trajectories)} < 10），跳過學習")
+        if len(other_trajectories) < 15:
+            print(f"{self.role} 代理: 軌跡仍不足（{len(other_trajectories)} < 15），跳過學習")
             return
         
         try:
@@ -629,6 +652,117 @@ class LLMAgent:
             
         except Exception as e:
             print(f"{self.role} 代理: 模式分析失敗: {e}")
+    
+    def _calculate_monthly_sentiment(self, monthly_data: List[Dict[str, Any]], selected_month: Dict[str, Any]) -> float:
+        """
+        基於月漲幅計算情感分數（>5% 為 0.7）
+        
+        Args:
+            monthly_data: 多月數據列表
+            selected_month: 選中的月份數據
+            
+        Returns:
+            情感分數 (-1 到 1 範圍)
+        """
+        try:
+            selected_price = float(selected_month.get('close', 0.0))
+            selected_date = selected_month.get('date', '')
+            
+            # 尋找前一個月的價格
+            prev_month_price = None
+            for i, month_data in enumerate(monthly_data):
+                if month_data.get('date') == selected_date and i > 0:
+                    prev_month_price = float(monthly_data[i-1].get('close', 0.0))
+                    break
+            
+            if prev_month_price and prev_month_price > 0:
+                monthly_growth = ((selected_price - prev_month_price) / prev_month_price) * 100
+                
+                if monthly_growth > 5.0:
+                    return 0.7
+                elif monthly_growth > 2.0:
+                    return 0.4
+                elif monthly_growth > -2.0:
+                    return 0.0
+                elif monthly_growth > -5.0:
+                    return -0.4
+                else:
+                    return -0.7
+            else:
+                # 無法計算月漲幅，使用中性值
+                return 0.0
+                
+        except Exception as e:
+            print(f"{self.role} 代理: 月漲幅情感計算失敗: {e}")
+            return 0.0
+    
+    def _generate_diverse_scenario_from_real_data(self, base_price: float, base_rsi: float, 
+                                                 base_sentiment: float, stock_code: str, 
+                                                 scenario_id: int) -> List[float]:
+        """
+        在真實數據基礎上生成多樣化的市場情況
+        
+        Args:
+            base_price: 基礎價格
+            base_rsi: 基礎 RSI
+            base_sentiment: 基礎情感
+            stock_code: 股票代碼
+            scenario_id: 情況編號
+            
+        Returns:
+            [price, rsi, sentiment] 列表
+        """
+        try:
+            np.random.seed(42 + scenario_id + sum(ord(c) for c in stock_code))
+            
+            # 在真實數據基礎上進行微調，保持真實性但增加多樣性
+            price_variation = np.random.uniform(-0.05, 0.05)  # 價格變化 ±5%
+            rsi_variation = np.random.uniform(-0.1, 0.1)      # RSI 變化 ±0.1
+            sentiment_variation = np.random.uniform(-0.2, 0.2) # 情感變化 ±0.2
+            
+            # 調整後的值
+            adjusted_price = base_price * (1 + price_variation)
+            adjusted_rsi = max(0.0, min(1.0, base_rsi + rsi_variation))
+            adjusted_sentiment = max(-1.0, min(1.0, base_sentiment + sentiment_variation))
+            
+            return [adjusted_price, adjusted_rsi, adjusted_sentiment]
+            
+        except Exception as e:
+            print(f"{self.role} 代理: 真實數據多樣化失敗: {e}")
+            return [base_price, base_rsi, base_sentiment]
+    
+    async def _generate_fallback_trajectories(self, other_trajectories: List[Dict[str, Any]], 
+                                            stock_code: str, target_count: int) -> None:
+        """
+        備用軌跡生成方法（當MCP失敗時使用）
+        
+        Args:
+            other_trajectories: 現有軌跡列表
+            stock_code: 股票代碼
+            target_count: 目標軌跡數量
+        """
+        try:
+            # 獲取基礎數據
+            real_data = await get_stock_data(stock_code)
+            base_price = real_data['price']
+            
+            needed_count = target_count - len(other_trajectories)
+            for i in range(needed_count):
+                # 使用原有的多樣化方法
+                enhanced_obs = self._generate_diverse_scenario(base_price, stock_code, i)
+                action = np.random.choice([0, 1, 2], p=[0.3, 0.4, 0.3])
+                
+                other_trajectories.append({
+                    'obs': enhanced_obs,
+                    'action': action,
+                    'stock_code': stock_code,
+                    'source': 'fallback_generation'
+                })
+                
+            print(f"{self.role} 代理: 備用方法生成 {needed_count} 筆軌跡")
+            
+        except Exception as e:
+            print(f"{self.role} 代理: 備用軌跡生成失敗: {e}")
     
     def _generate_diverse_scenario(self, base_price: float, stock_code: str, scenario_id: int) -> List[float]:
         """

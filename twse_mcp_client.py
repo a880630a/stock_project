@@ -23,7 +23,7 @@ dotenv.load_dotenv()
 
 def calculate_rsi(prices: List[float], period: int = 14) -> float:
     """
-    計算真實 RSI 指標
+    計算真實 RSI 指標，使用滾動平均方法
     
     Args:
         prices: 價格序列（由舊到新）
@@ -37,6 +37,32 @@ def calculate_rsi(prices: List[float], period: int = 14) -> float:
         return 0.5
     
     try:
+        import pandas as pd
+        
+        # 使用 pandas 計算滾動平均 RSI
+        prices_series = pd.Series(prices, dtype=float)
+        price_changes = prices_series.pct_change().dropna()
+        
+        # 計算漲跌幅
+        gains = price_changes.where(price_changes > 0, 0)
+        losses = -price_changes.where(price_changes < 0, 0)
+        
+        # 使用滾動平均計算 RSI
+        avg_gains = gains.rolling(window=period, min_periods=1).mean()
+        avg_losses = losses.rolling(window=period, min_periods=1).mean()
+        
+        # 計算 RS 和 RSI
+        rs = avg_gains / avg_losses
+        rsi = 100 - (100 / (1 + rs))
+        
+        # 取最後一個有效值並轉換為 0-1 範圍
+        final_rsi = rsi.iloc[-1] / 100.0 if not pd.isna(rsi.iloc[-1]) else 0.5
+        
+        return max(0.0, min(1.0, final_rsi))  # 確保在 0-1 範圍內
+        
+    except ImportError:
+        # 如果沒有 pandas，使用原來的方法
+        logger.warning("pandas 不可用，使用簡化 RSI 計算")
         prices = np.array(prices, dtype=float)
         deltas = np.diff(prices)
         
@@ -177,13 +203,13 @@ class TWSEMCPClient:
             return {'success': False, 'error': f'解析結構化文字失敗: {str(e)}'}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    async def get_monthly_stock_data(self, code: str, months: int = 5) -> List[Dict[str, Any]]:
+    async def get_monthly_stock_data(self, code: str, months: int = 12) -> List[Dict[str, Any]]:
         """
-        獲取股票多月交易數據
+        獲取股票多月交易數據，預設獲取12個月數據用於真實RSI計算
         
         Args:
             code: 股票代碼
-            months: 獲取月數，預設 5 個月
+            months: 獲取月數，預設 12 個月
             
         Returns:
             多月數據列表
@@ -218,7 +244,7 @@ class TWSEMCPClient:
     async def get_stock_data(self, code: str, use_multi_month: bool = True) -> Dict[str, Any]:
         """
         獲取股票交易數據，提取 price, RSI, sentiment。
-        優化版本：使用多月數據計算真實 RSI，隨機選取一月作為觀察值。
+        優化版本：使用12月數據計算真實 RSI，基於月漲幅計算 sentiment。
         
         Args:
             code: 股票代碼（如 '2330'）
@@ -232,9 +258,9 @@ class TWSEMCPClient:
                 raise ValueError("MCP 客戶端未初始化")
             
             if use_multi_month:
-                # 嘗試獲取多月數據
-                logger.info(f"獲取股票 {code} 的多月數據以計算真實 RSI")
-                monthly_data = await self.get_monthly_stock_data(code, months=5)
+                # 獲取12個月數據
+                logger.info(f"獲取股票 {code} 的12個月數據以計算真實 RSI")
+                monthly_data = await self.get_monthly_stock_data(code, months=12)
                 
                 if len(monthly_data) >= 3:  # 至少需要 3 個月數據
                     # 隨機選取一個月作為觀察點
@@ -242,11 +268,14 @@ class TWSEMCPClient:
                     price = float(selected_month.get('close', 0.0))
                     volume = int(selected_month.get('volume', 0))
                     
-                    # 提取價格序列計算真實 RSI
+                    # 提取價格序列計算真實 RSI（使用滾動平均）
                     prices = [float(month_data.get('close', 0.0)) for month_data in monthly_data]
-                    rsi = calculate_rsi(prices)
+                    rsi = calculate_rsi(prices, period=14)
                     
-                    logger.info(f"使用多月數據計算 RSI: {rsi:.3f}, 選中月份價格: {price}")
+                    # 基於月漲幅計算 sentiment（>5% 為 0.7）
+                    sentiment = self._calculate_sentiment_from_monthly_growth(monthly_data, selected_month)
+                    
+                    logger.info(f"使用12月數據計算 RSI: {rsi:.3f}, 選中月份價格: {price}, sentiment: {sentiment:.3f}")
                 else:
                     # 數據不足，回退到單日數據
                     logger.warning(f"多月數據不足 ({len(monthly_data)}), 回退到單日數據")
@@ -255,16 +284,14 @@ class TWSEMCPClient:
                 # 直接使用單日數據
                 return await self._get_single_day_data(code)
                 
-            # 計算情感分數（基於價格區間和 RSI）
-            sentiment = self._calculate_sentiment(price, rsi)
-            
             result = {
                 'price': price,
                 'rsi': rsi,
                 'sentiment': sentiment,
                 'volume': volume,
                 'code': code,
-                'data_source': 'multi_month' if use_multi_month else 'single_day'
+                'data_source': 'multi_month_12' if use_multi_month else 'single_day',
+                'monthly_data_count': len(monthly_data) if use_multi_month else 0
             }
             
             logger.info(f"股票 {code} 數據獲取成功: price={price:.2f}, rsi={rsi:.3f}, sentiment={sentiment:.3f}")
@@ -349,8 +376,59 @@ class TWSEMCPClient:
             logger.warning(f"RSI 模擬失敗: {e}，使用預設值")
             return 0.5
     
-    def _calculate_sentiment(self, price: float, rsi: float) -> float:
-        """計算情感分數的輔助方法"""
+    def _calculate_sentiment_from_monthly_growth(self, monthly_data: List[Dict[str, Any]], selected_month: Dict[str, Any]) -> float:
+        """
+        基於月漲幅計算情感分數（>5% 為 0.7）
+        
+        Args:
+            monthly_data: 多月數據列表
+            selected_month: 選中的月份數據
+            
+        Returns:
+            情感分數 (-1 到 1 範圍)
+        """
+        try:
+            # 找到選中月份在數據中的位置
+            selected_price = float(selected_month.get('close', 0.0))
+            
+            # 尋找前一個月的價格來計算漲幅
+            selected_date = selected_month.get('date', '')
+            prev_month_price = None
+            
+            for i, month_data in enumerate(monthly_data):
+                if month_data.get('date') == selected_date and i > 0:
+                    prev_month_price = float(monthly_data[i-1].get('close', 0.0))
+                    break
+            
+            if prev_month_price and prev_month_price > 0:
+                # 計算月漲幅
+                monthly_growth = ((selected_price - prev_month_price) / prev_month_price) * 100
+                
+                # 基於月漲幅設定情感分數
+                if monthly_growth > 5.0:  # 漲幅超過 5%
+                    sentiment = 0.7
+                elif monthly_growth > 2.0:  # 漲幅 2-5%
+                    sentiment = 0.4
+                elif monthly_growth > -2.0:  # 漲跌幅在 -2% 到 2% 之間
+                    sentiment = 0.0
+                elif monthly_growth > -5.0:  # 跌幅 2-5%
+                    sentiment = -0.4
+                else:  # 跌幅超過 5%
+                    sentiment = -0.7
+                
+                logger.debug(f"月漲幅: {monthly_growth:.2f}%, 情感分數: {sentiment:.3f}")
+                return sentiment
+            else:
+                # 無法計算月漲幅，使用原有方法
+                logger.warning("無法計算月漲幅，使用價格基礎情感計算")
+                return self._calculate_sentiment_fallback(selected_price)
+                
+        except Exception as e:
+            logger.warning(f"月漲幅情感計算失敗: {e}，使用備用方法")
+            return self._calculate_sentiment_fallback(float(selected_month.get('close', 100.0)))
+    
+    def _calculate_sentiment_fallback(self, price: float) -> float:
+        """備用情感計算方法（原有邏輯）"""
         # 基於價格區間的基礎情感
         if price > 500:
             base_sentiment = 0.7  # 高價股偏正面
@@ -361,16 +439,11 @@ class TWSEMCPClient:
         else:
             base_sentiment = -0.3  # 低價股偏負面
         
-        # RSI 調整：超買時降低情感，超賣時提高情感
-        if rsi > 0.7:  # 超買
-            sentiment_adjustment = -0.2
-        elif rsi < 0.3:  # 超賣
-            sentiment_adjustment = 0.2
-        else:
-            sentiment_adjustment = 0.0
-        
-        final_sentiment = base_sentiment + sentiment_adjustment
-        return max(-1.0, min(1.0, final_sentiment))  # 限制在 -1 到 1 範圍
+        return max(-1.0, min(1.0, base_sentiment))  # 限制在 -1 到 1 範圍
+    
+    def _calculate_sentiment(self, price: float, rsi: float) -> float:
+        """計算情感分數的輔助方法（保持向後兼容）"""
+        return self._calculate_sentiment_fallback(price)
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def get_financial_insights(self, code: str) -> Dict[str, Any]:
