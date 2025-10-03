@@ -13,6 +13,11 @@ from typing import Tuple, List, Dict, Any
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 使用非互動式後端
+
+# 配置中文字體支援
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK JP', 'AR PL UMing CN', 'AR PL UKai CN', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 解決負號顯示問題
+plt.rcParams['font.family'] = 'sans-serif'
 try:
     from imitation.algorithms import bc  # 行為克隆
     from imitation.data.types import Transitions  # 軌跡轉換類型
@@ -482,10 +487,10 @@ class LLMAgent:
                 print(f"{self.role} 代理: Transitions 對象創建失敗: {e}")
                 return
             
-            # 創建 BC 訓練器，使用最保守和兼容的參數
+            # 創建 BC 訓練器，使用優化的參數配置
             try:
-                # 使用最小的批次大小，避免索引問題
-                batch_size = 1
+                # 優化的批次大小，提升訓練穩定性
+                batch_size = min(4, len(obs_data))  # 最大4，避免數據不足
                 print(f"{self.role} 代理: 準備創建 BC 訓練器，數據量: {len(obs_data)}, 批次大小: {batch_size}")
                 
                 # 創建兼容的 observation_space 和 action_space
@@ -497,16 +502,17 @@ class LLMAgent:
                 )
                 action_space = spaces.Discrete(3)
                 
+                # 優化的訓練參數配置
                 trainer = bc.BC(
                     observation_space=observation_space,
                     action_space=action_space,
                     demonstrations=[transitions],
                     batch_size=batch_size,
-                    ent_weight=0.0,  # 完全禁用熵正則化
-                    l2_weight=0.0,   # 禁用 L2 正則化
+                    ent_weight=0.01,    # 啟用熵正則化，防止崩潰
+                    l2_weight=0.001,    # L2 正則化，防止過擬合
                     rng=np.random.default_rng(42)
                 )
-                print(f"{self.role} 代理: BC 訓練器創建成功")
+                print(f"{self.role} 代理: BC 訓練器創建成功（優化配置：ent_weight=0.01, l2_weight=0.001）")
             except Exception as e:
                 print(f"{self.role} 代理: BC 訓練器創建失敗: {e}")
                 print(f"  詳細錯誤: {str(e)}")
@@ -548,38 +554,93 @@ class LLMAgent:
             raise e
     
     def _plot_bc_metrics(self) -> None:
-        """生成 BC 訓練指標可視化圖表"""
+        """生成優化的 BC 訓練指標可視化圖表，包含平均值線和趨勢分析"""
         try:
             if not self.bc_metrics or not self.bc_metrics['epochs']:
                 print(f"{self.role} 代理: 無 BC 指標數據，跳過圖表生成")
                 return
             
-            plt.figure(figsize=(15, 5))
+            epochs = np.array(self.bc_metrics['epochs'])
+            losses = np.array(self.bc_metrics['losses'])
+            prob_true_acts = np.array(self.bc_metrics['prob_true_acts'])
+            entropies = np.array(self.bc_metrics['entropies'])
+            
+            # 計算累積平均值
+            cumsum_losses = np.cumsum(losses)
+            cumsum_probs = np.cumsum(prob_true_acts)
+            cumsum_entropies = np.cumsum(entropies)
+            
+            avg_losses = cumsum_losses / np.arange(1, len(losses) + 1)
+            avg_probs = cumsum_probs / np.arange(1, len(prob_true_acts) + 1)
+            avg_entropies = cumsum_entropies / np.arange(1, len(entropies) + 1)
+            
+            plt.figure(figsize=(18, 5))
             
             # 子圖 1: 訓練損失
             plt.subplot(1, 3, 1)
-            plt.plot(self.bc_metrics['epochs'], self.bc_metrics['losses'], 'b-', linewidth=2, marker='o')
-            plt.title(f'BC Training Loss - {self.role.capitalize()}')
+            plt.plot(epochs, losses, 'b-', linewidth=2, marker='o', label='Loss', alpha=0.7)
+            plt.plot(epochs, avg_losses, 'b--', linewidth=2, label='累積平均', alpha=0.9)
+            plt.axhline(y=np.mean(losses), color='gray', linestyle=':', linewidth=1, label=f'總平均={np.mean(losses):.3f}')
+            plt.title(f'BC Training Loss - {self.role.capitalize()}', fontsize=12, fontweight='bold')
             plt.xlabel('Epoch')
             plt.ylabel('Loss')
+            plt.legend(loc='best')
             plt.grid(True, alpha=0.3)
             
-            # 子圖 2: 真實動作概率
+            # 添加趨勢標註
+            if len(losses) > 1:
+                trend = "下降" if losses[-1] < losses[0] else "上升"
+                change_pct = ((losses[-1] - losses[0]) / losses[0]) * 100
+                plt.text(0.98, 0.02, f'趨勢: {trend} ({change_pct:+.1f}%)', 
+                        transform=plt.gca().transAxes, ha='right', va='bottom',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            # 子圖 2: 真實動作概率（準確率）
             plt.subplot(1, 3, 2)
-            plt.plot(self.bc_metrics['epochs'], self.bc_metrics['prob_true_acts'], 'g-', linewidth=2, marker='s')
-            plt.title(f'Probability of True Action - {self.role.capitalize()}')
+            plt.plot(epochs, prob_true_acts, 'g-', linewidth=2, marker='s', label='Accuracy', alpha=0.7)
+            plt.plot(epochs, avg_probs, 'g--', linewidth=2, label='累積平均', alpha=0.9)
+            plt.axhline(y=0.6, color='orange', linestyle=':', linewidth=1, label='目標線 (0.6)')
+            plt.axhline(y=np.mean(prob_true_acts), color='gray', linestyle=':', linewidth=1, 
+                       label=f'總平均={np.mean(prob_true_acts):.3f}')
+            plt.title(f'Probability of True Action - {self.role.capitalize()}', fontsize=12, fontweight='bold')
             plt.xlabel('Epoch')
             plt.ylabel('Prob True Act')
+            plt.legend(loc='best')
             plt.grid(True, alpha=0.3)
             plt.ylim(0, 1)
             
+            # 添加趨勢標註
+            if len(prob_true_acts) > 1:
+                trend = "上升" if prob_true_acts[-1] > prob_true_acts[0] else "下降"
+                change_pct = ((prob_true_acts[-1] - prob_true_acts[0]) / (prob_true_acts[0] + 1e-8)) * 100
+                status = "✓ PASS" if prob_true_acts[-1] > 0.6 else "⚠ 需改進"
+                plt.text(0.98, 0.02, f'趨勢: {trend} ({change_pct:+.1f}%)\n{status}', 
+                        transform=plt.gca().transAxes, ha='right', va='bottom',
+                        bbox=dict(boxstyle='round', facecolor='lightgreen' if prob_true_acts[-1] > 0.6 else 'wheat', alpha=0.5))
+            
             # 子圖 3: 熵值
             plt.subplot(1, 3, 3)
-            plt.plot(self.bc_metrics['epochs'], self.bc_metrics['entropies'], 'r-', linewidth=2, marker='^')
-            plt.title(f'Policy Entropy - {self.role.capitalize()}')
+            plt.plot(epochs, entropies, 'r-', linewidth=2, marker='^', label='Entropy', alpha=0.7)
+            plt.plot(epochs, avg_entropies, 'r--', linewidth=2, label='累積平均', alpha=0.9)
+            plt.axhline(y=0.5, color='orange', linestyle=':', linewidth=1, label='下限 (0.5)')
+            plt.axhline(y=1.0, color='purple', linestyle=':', linewidth=1, label='上限 (1.0)')
+            plt.axhline(y=np.mean(entropies), color='gray', linestyle=':', linewidth=1, 
+                       label=f'總平均={np.mean(entropies):.3f}')
+            plt.title(f'Policy Entropy - {self.role.capitalize()}', fontsize=12, fontweight='bold')
             plt.xlabel('Epoch')
             plt.ylabel('Entropy')
+            plt.legend(loc='best')
             plt.grid(True, alpha=0.3)
+            
+            # 添加趨勢標註和範圍檢查
+            if len(entropies) > 1:
+                final_entropy = entropies[-1]
+                in_range = 0.5 <= final_entropy <= 1.0
+                status = "✓ PASS" if in_range else "⚠ 超出範圍"
+                trend = "穩定" if abs(entropies[-1] - entropies[0]) < 0.1 else ("上升" if entropies[-1] > entropies[0] else "下降")
+                plt.text(0.98, 0.02, f'趨勢: {trend}\n最終值: {final_entropy:.3f}\n{status}', 
+                        transform=plt.gca().transAxes, ha='right', va='bottom',
+                        bbox=dict(boxstyle='round', facecolor='lightgreen' if in_range else 'wheat', alpha=0.5))
             
             plt.tight_layout()
             
@@ -588,7 +649,10 @@ class LLMAgent:
             plt.savefig(filename, dpi=300, bbox_inches='tight')
             plt.close()  # 釋放記憶體
             
-            print(f"{self.role} 代理: BC 指標圖表已保存為 {filename}")
+            print(f"{self.role} 代理: 優化的 BC 指標圖表已保存為 {filename}")
+            print(f"  - 最終 Loss: {losses[-1]:.4f} (平均: {np.mean(losses):.4f})")
+            print(f"  - 最終準確率: {prob_true_acts[-1]:.3f} (平均: {np.mean(prob_true_acts):.3f})")
+            print(f"  - 最終熵值: {entropies[-1]:.3f} (平均: {np.mean(entropies):.3f})")
             
         except Exception as e:
             print(f"{self.role} 代理: 生成 BC 指標圖表失敗: {e}")
@@ -824,6 +888,7 @@ class LLMAgent:
     def _advanced_behavior_cloning(self, observations: np.ndarray, actions: np.ndarray) -> bool:
         """
         改進的行為克隆實現，包含真實的訓練過程和指標記錄
+        優化版本：增加訓練輪數、添加正則化、熵值監控
         
         Args:
             observations: 觀測數據 (N, 3)
@@ -833,22 +898,26 @@ class LLMAgent:
             bool: 訓練是否成功
         """
         try:
-            print(f"{self.role} 代理: 執行改進的行為克隆，數據形狀: obs={observations.shape}, acts={actions.shape}")
+            print(f"{self.role} 代理: 執行優化的行為克隆，數據形狀: obs={observations.shape}, acts={actions.shape}")
             
-            # 模擬真實的神經網路訓練過程
-            n_epochs = 5
-            learning_rate = 0.01
+            # 優化的訓練參數
+            n_epochs = 10  # 增加訓練輪數
+            learning_rate = 0.01  # 學習率
+            l2_weight = 0.001  # L2 正則化權重
+            label_smoothing = 0.1  # Label smoothing 參數（保持熵值的關鍵）
+            epsilon = 1e-8  # 數值穩定性常數
             
             # 初始化簡化的「策略網路」參數
             n_features = observations.shape[1]  # 3 (price, rsi, sentiment)
             n_actions = 3  # 0, 1, 2
             
-            # 簡化的線性模型權重 (隨機初始化)
+            # 簡化的線性模型權重 (隨機初始化）
             np.random.seed(42)  # 確保可重現性
             weights = np.random.randn(n_features, n_actions) * 0.1
             bias = np.zeros(n_actions)
             
-            print(f"{self.role} 代理: 開始 {n_epochs} 個 epoch 的訓練...")
+            print(f"{self.role} 代理: 開始優化的 {n_epochs} 個 epoch 訓練...")
+            print(f"  配置: learning_rate={learning_rate}, label_smoothing={label_smoothing}, l2_weight={l2_weight}")
             
             for epoch in range(n_epochs):
                 # 前向傳播
@@ -858,47 +927,85 @@ class LLMAgent:
                 exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
                 probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
                 
-                # 計算損失 (交叉熵)
-                epsilon = 1e-8  # 避免 log(0)
+                # Label Smoothing：創建平滑的目標分佈（保持熵值的關鍵）
                 one_hot = np.zeros_like(probs)
                 one_hot[np.arange(len(actions)), actions] = 1
-                loss = -np.mean(np.sum(one_hot * np.log(probs + epsilon), axis=1))
+                
+                # 應用 label smoothing：將目標分佈平滑化
+                # smooth_labels = (1 - label_smoothing) * one_hot + label_smoothing / n_actions
+                smooth_labels = one_hot * (1 - label_smoothing) + label_smoothing / n_actions
+                
+                # 交叉熵損失（使用平滑標籤）
+                ce_loss = -np.mean(np.sum(smooth_labels * np.log(probs + epsilon), axis=1))
+                
+                # 計算熵（用於監控）
+                entropy = -np.mean(np.sum(probs * np.log(probs + epsilon), axis=1))
+                
+                # L2 正則化
+                l2_reg = l2_weight * (np.sum(weights ** 2) + np.sum(bias ** 2))
+                
+                # 總損失 = 交叉熵損失 + L2正則化
+                total_loss = ce_loss + l2_reg
                 
                 # 計算準確率
                 predicted_actions = np.argmax(probs, axis=1)
                 accuracy = np.mean(predicted_actions == actions)
                 
-                # 計算熵
-                entropy = -np.mean(np.sum(probs * np.log(probs + epsilon), axis=1))
-                
                 # 記錄指標
-                self.bc_metrics['losses'].append(loss)
+                self.bc_metrics['losses'].append(total_loss)
                 self.bc_metrics['prob_true_acts'].append(accuracy)
                 self.bc_metrics['entropies'].append(entropy)
                 self.bc_metrics['epochs'].append(epoch + 1)
                 
-                print(f"  Epoch {epoch+1}/{n_epochs}: Loss={loss:.4f}, Accuracy={accuracy:.3f}, Entropy={entropy:.3f}")
+                # 檢查熵值是否過低並調整label smoothing
+                entropy_warning = ""
+                if entropy < 0.1:
+                    entropy_warning = " ⚠️ 熵過低！"
+                    # 動態增加 label smoothing
+                    old_smoothing = label_smoothing
+                    label_smoothing = min(label_smoothing * 1.2, 0.3)  # 最大0.3
+                    if label_smoothing != old_smoothing:
+                        print(f"  ⚠️  熵值過低 ({entropy:.3f} < 0.1)，增加 label_smoothing: {old_smoothing:.4f} → {label_smoothing:.4f}")
+                
+                # 檢查熵值範圍
+                entropy_status = "✓" if 0.5 <= entropy <= 1.0 else "⚠"
+                
+                print(f"  Epoch {epoch+1}/{n_epochs}: Loss={total_loss:.4f}, Accuracy={accuracy:.3f}, "
+                      f"Entropy={entropy:.3f} {entropy_status}{entropy_warning}")
                 
                 # 簡化的反向傳播更新
                 if epoch < n_epochs - 1:  # 最後一個 epoch 不更新
-                    # 計算梯度 (簡化版)
-                    grad_output = probs - one_hot
-                    grad_weights = np.dot(observations.T, grad_output) / len(observations)
-                    grad_bias = np.mean(grad_output, axis=0)
+                    # 計算梯度（使用平滑標籤）
+                    grad_output = (probs - smooth_labels) / len(observations)
+                    
+                    grad_weights = np.dot(observations.T, grad_output)
+                    grad_bias = np.sum(grad_output, axis=0)
+                    
+                    # 添加 L2 正則化梯度
+                    grad_weights += 2 * l2_weight * weights
+                    grad_bias += 2 * l2_weight * bias
                     
                     # 更新參數
                     weights -= learning_rate * grad_weights
                     bias -= learning_rate * grad_bias
             
+            # 訓練完成後的診斷
+            final_entropy = self.bc_metrics['entropies'][-1]
+            final_accuracy = self.bc_metrics['prob_true_acts'][-1]
+            
+            print(f"\n{self.role} 代理: 訓練完成診斷")
+            print(f"  最終準確率: {final_accuracy:.3f} {'✓ PASS' if final_accuracy > 0.6 else '⚠ 需改進'}")
+            print(f"  最終熵值: {final_entropy:.3f} {'✓ PASS' if 0.5 <= final_entropy <= 1.0 else '⚠ 超出範圍'}")
+            
             # 分析學習到的模式
             final_probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
             self._analyze_learned_patterns_advanced(observations, actions, final_probs)
             
-            print(f"{self.role} 代理: 改進的行為克隆訓練完成")
+            print(f"{self.role} 代理: 優化的行為克隆訓練完成")
             return True
             
         except Exception as e:
-            print(f"{self.role} 代理: 改進的行為克隆失敗: {e}")
+            print(f"{self.role} 代理: 優化的行為克隆失敗: {e}")
             return False
     
     def _safe_behavior_cloning(self, observations: np.ndarray, actions: np.ndarray) -> bool:
